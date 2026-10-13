@@ -6,14 +6,14 @@ import asyncio
 import errno
 import json
 import logging
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlsplit
 
 from aiohttp import web
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import HfHubHTTPError
 
-_MODEL_DIRS = {"diffusion_models", "text_encoders", "vae", "audio_vae"}
+_MODEL_DIRS = {"diffusion_models", "text_encoders", "vae", "audio_vae", "upscale_models"}
 _MIN_HF_URL_PARTS = 5  # owner/repo/resolve/main/file
 
 
@@ -22,6 +22,15 @@ def model_plan(workflows: Path) -> list[dict[str, str]]:
     for workflow in sorted(workflows.glob("*.json")):
         graph = json.loads(workflow.read_text(encoding="utf-8"))
         for node in graph["nodes"]:
+            for item in node.get("properties", {}).get("local_required_models", []):
+                name = PurePosixPath(item["name"])
+                if item["directory"] not in _MODEL_DIRS or not name.parts or name.is_absolute() or PureWindowsPath(item["name"]).drive or ".." in name.parts or "\\" in item["name"]:
+                    raise ValueError("Invalid local model manifest")
+                key = item["directory"] + "/" + item["name"]
+                entry = {**item, "source": "local"}
+                if key in entries and entries[key] != entry:
+                    raise ValueError("Conflicting packaged model destinations")
+                entries[key] = entry
             for field in ("models", "kandinsky6_required_files"):
                 for item in node.get("properties", {}).get(field, []):
                     name = PurePosixPath(item["name"])
@@ -29,7 +38,9 @@ def model_plan(workflows: Path) -> list[dict[str, str]]:
                     parts = url.path.strip("/").split("/")
                     if (
                         item["directory"] not in _MODEL_DIRS
+                        or not name.parts
                         or name.is_absolute()
+                        or PureWindowsPath(item["name"]).drive
                         or ".." in name.parts
                         or "\\" in item["name"]
                         or url.scheme != "https"
@@ -46,8 +57,6 @@ def model_plan(workflows: Path) -> list[dict[str, str]]:
                     if key in entries and entries[key] != entry:
                         raise ValueError("Conflicting packaged model destinations")
                     entries[key] = entry
-    if not entries:
-        raise ValueError("Empty packaged model manifest")
     return list(entries.values())
 
 
@@ -63,6 +72,11 @@ def existing_model(entry, models_root, extra_roots):
 def download_model(entry, models_root, extra_roots):
     if existing_model(entry, models_root, extra_roots) is not None:
         return "reused"
+    if entry.get("source") == "local":
+        raise FileNotFoundError(
+            f"Converted model {entry['directory']}/{entry['name']} is missing. "
+            "Place the converted single-file weights in the configured model folder; this file has no direct download URL."
+        )
     category = models_root / entry["directory"]
     destination = category / entry["name"]
     if not destination.parent.resolve().is_relative_to(category.resolve()):
@@ -85,6 +99,8 @@ def download_model(entry, models_root, extra_roots):
 
 
 def download_error(error):
+    if isinstance(error, FileNotFoundError):
+        return str(error)
     if isinstance(error, HfHubHTTPError) and error.response is not None and error.response.status_code in (401, 403):
         return "Hugging Face access required. Run hf auth login on this server, then retry."
     if isinstance(error, OSError) and error.errno == errno.ENOSPC:

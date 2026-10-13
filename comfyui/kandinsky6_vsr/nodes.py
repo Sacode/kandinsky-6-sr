@@ -18,6 +18,7 @@ import folder_paths
 import torch
 import torch.nn.functional as F  # noqa: N812 - PyTorch convention
 import yaml
+from safetensors import SafetensorError, safe_open
 
 from . import sampling
 from .nabla import warmup as warmup_nabla
@@ -31,6 +32,7 @@ from .runtime.core.components.model.vae_io import cast_to_module_dtype, decode_l
 from .runtime.core.components.video_kvae.cached_model import CachedCausalVAE
 from .runtime.pipeline.diffusers_bundle import (
     COMPONENT_WEIGHTS,
+    COMPONENT_CONFIG_METADATA,
     kvae_architecture,
     lu_bank_conf_from_component,
     read_component_config,
@@ -54,6 +56,7 @@ _SCALES = {"2.25x": 2.25, "2x": 2.0, "4x": 4.0}
 _KVAE_SUFFIXES = frozenset({".safetensors", ".ckpt"})
 _LU_SUFFIXES = frozenset({".safetensors", ".pt"})
 _LU_BANK_SUFFIXES = frozenset({".yaml", ".yml"})
+_MODEL_FOLDERS = (SR_MODEL_FOLDER, "diffusion_models", "vae", "upscale_models")
 
 # Activation room requested from ``load_models_gpu`` for each SR stage, so
 # ComfyUI keeps enough free memory for the forward pass when it decides how
@@ -69,7 +72,7 @@ _VAE_SEGMENT_FRAMES = 17
 
 def _model_files():
     names = set()
-    for folder in (SR_MODEL_FOLDER, "diffusion_models"):
+    for folder in _MODEL_FOLDERS:
         try:
             names.update(folder_paths.get_filename_list(folder))
         except (KeyError, OSError):
@@ -78,15 +81,24 @@ def _model_files():
 
 
 def _full_model_path(name):
-    for folder in (SR_MODEL_FOLDER, "diffusion_models"):
+    for folder in _MODEL_FOLDERS:
         path = folder_paths.get_full_path(folder, name)
         if path is not None:
             return Path(path)
     return None
 
 
+def _safetensors_metadata(path):
+    if path.suffix.lower() == ".safetensors":
+        with safe_open(str(path), framework="pt", device="cpu", backend="pread") as archive:
+            return archive.metadata() or {}
+    return {}
+
+
 def _diffusers_config(path):
-    """Inspect JSON beside a bundle component without converting or writing sidecars."""
+    """Read embedded component JSON first, then a Diffusers bundle's config."""
+    if COMPONENT_CONFIG_METADATA in _safetensors_metadata(path):
+        return read_component_config(path)
     if path.name != COMPONENT_WEIGHTS or not (path.parent / "config.json").is_file():
         return None
     try:
@@ -98,8 +110,8 @@ def _diffusers_config(path):
 def _resolve_model_file(name, kind):
     if not name:
         raise FileNotFoundError(
-            f"No Kandinsky6 SR {kind} was selected. Download the Diffusers SR bundle under "
-            f"ComfyUI/models/diffusion_models/ (or configure an extra '{SR_MODEL_FOLDER}' model path)."
+            f"No Kandinsky6 SR {kind} was selected. Put the single-file SR models in "
+            f"ComfyUI/models/vae/ or models/upscale_models/ (or configure extra model paths)."
         )
     path = _full_model_path(name)
     if path is None:
@@ -140,11 +152,11 @@ def _list_kvae_checkpoints():
             continue
         try:
             config = _diffusers_config(path)
-        except (OSError, ValueError):
+        except (OSError, ValueError, SafetensorError):
             continue
         if (config and config.get("vae_type") == VAE["name"]) or path.with_suffix(".yaml").is_file():
             names.append(name)
-    return sorted(names)
+    return sorted(names, key=lambda name: (Path(name).name == COMPONENT_WEIGHTS, name))
 
 
 def _list_latent_upscaler_checkpoints():
@@ -155,7 +167,7 @@ def _list_latent_upscaler_checkpoints():
             continue
         try:
             config = _diffusers_config(path)
-        except (OSError, ValueError):
+        except (OSError, ValueError, SafetensorError):
             continue
         if config is not None:
             models = config.get("models")
@@ -168,7 +180,7 @@ def _list_latent_upscaler_checkpoints():
             continue  # a DiT directory or a KVAE sidecar pair
         if any(str(entry.get("target_scale", "4x")) in ("2x", "4x") for entry in _lu_entries_for(path)):
             names.append(name)
-    return sorted(names)
+    return sorted(names, key=lambda name: (Path(name).name == COMPONENT_WEIGHTS, name))
 
 
 def _patcher(module, load_device, offload_device):
@@ -214,7 +226,7 @@ class Kandinsky6SRVAELoader:
             "required": {
                 "kvae_checkpoint": (
                     _list_kvae_checkpoints(),
-                    {"tooltip": "SR Diffusers bundle: vae/diffusion_pytorch_model.safetensors with config.json."},
+                    {"tooltip": "Single-file SR KVAE with embedded config; Diffusers bundles and legacy YAML pairs also work."},
                 ),
             }
         }
@@ -232,7 +244,7 @@ class Kandinsky6SRVAELoader:
         if component is not None:
             if (component.get("spatial_factor"), component.get("temporal_factor")) != (SPATIAL_FACTOR, TEMPORAL_FACTOR):
                 raise ValueError("KVAE component must use the released spatial/temporal factors (16, 4).")
-            architecture = kvae_architecture(path.parent)
+            architecture = kvae_architecture(path if COMPONENT_CONFIG_METADATA in _safetensors_metadata(path) else path.parent)
             if any(
                 params.get("z_channels") != int(DIT_CONFIG["in_visual_dim"])
                 for params in (architecture.encoder_params, architecture.decoder_params)
@@ -269,15 +281,14 @@ class Kandinsky6LatentUpscalerLoader:
                 "latent_upscaler_checkpoint": (
                     _list_latent_upscaler_checkpoints(),
                     {
-                        "tooltip": "SR Diffusers bundle: latent_upscaler/diffusion_pytorch_model.safetensors "
-                        "with config.json."
+                        "tooltip": "Single-file SR latent upscaler with embedded config; Diffusers bundles also work."
                     },
                 ),
                 "target_scale": (
                     ["2x", "4x"],
                     {
                         "default": "2x",
-                        "tooltip": "Entry to load from the Diffusers bank: 2x for 2x/2.25x VSR, 4x for 4x VSR.",
+                        "tooltip": "Bank entry: 2x for 2x/2.25x VSR, 4x for 4x VSR.",
                     },
                 ),
             }
@@ -294,14 +305,14 @@ class Kandinsky6LatentUpscalerLoader:
         path = _resolve_model_file(latent_upscaler_checkpoint, "latent-upscaler checkpoint")
         component = _diffusers_config(path)
         if component is not None:
-            bank = lu_bank_conf_from_component(path.parent)
+            bank = lu_bank_conf_from_component(path if COMPONENT_CONFIG_METADATA in _safetensors_metadata(path) else path.parent)
             entries = [entry for entry in bank.latent_upscaler.models if entry.target_scale == target_scale]
         else:
-            entries = [entry for entry in _lu_entries_for(path) if str(entry.get("target_scale", "4x")) in ("2x", "4x")]
+            entries = [entry for entry in _lu_entries_for(path) if str(entry.get("target_scale", "4x")) == target_scale]
         if len(entries) != 1:
             raise FileNotFoundError(
                 f"Expected exactly one latent-upscaler bank entry for {path.name} (scale={target_scale}), "
-                f"found {len(entries)}. Keep the component's config.json beside its weights."
+                f"found {len(entries)}. Use embedded component metadata or keep config.json beside its weights."
             )
         entry = OmegaConf.create(
             {

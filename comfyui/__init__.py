@@ -19,7 +19,7 @@ if getattr(PromptServer, "instance", None) is not None:
         Path(folder_paths.models_dir),
         {
             kind: list(folder_paths.folder_names_and_paths.get(kind, ([], set()))[0])
-            for kind in ("diffusion_models", "text_encoders", "vae")
+            for kind in ("diffusion_models", "text_encoders", "vae", "upscale_models")
         },
     )
 

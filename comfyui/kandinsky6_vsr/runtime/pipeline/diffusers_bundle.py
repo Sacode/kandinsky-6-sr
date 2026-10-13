@@ -29,6 +29,7 @@ from ..pipeline.kvae_sidecar import KvaeArchitecture, write_kvae_sidecar
 MODEL_INDEX = "model_index.json"
 COMPONENT_CONFIG = "config.json"
 COMPONENT_WEIGHTS = "diffusion_pytorch_model.safetensors"
+COMPONENT_CONFIG_METADATA = "kandinsky6.component_config"
 SCHEDULER_CONFIG = "scheduler_config.json"
 
 TRANSFORMER = "transformer"
@@ -92,8 +93,23 @@ def is_component_dir(path: Path) -> bool:
 
 
 def read_component_config(component_dir: Path) -> dict[str, Any]:
-    """Load a component's ``config.json`` without the Diffusers bookkeeping keys (``_class_name`` ...)."""
-    config = json.loads((component_dir / COMPONENT_CONFIG).read_text())
+    """Read component JSON from a bundle directory or a self-contained safetensors file."""
+    if component_dir.is_file():
+        with safe_open(str(component_dir), framework="pt", device="cpu", backend="pread") as archive:
+            metadata = archive.metadata() or {}
+        serialized = metadata.get(COMPONENT_CONFIG_METADATA)
+        if serialized is None:
+            raise ValueError(f"{component_dir} has no {COMPONENT_CONFIG_METADATA!r} metadata")
+        config_location = f"{component_dir} metadata {COMPONENT_CONFIG_METADATA}"
+    else:
+        config_location = str(component_dir / COMPONENT_CONFIG)
+        serialized = (component_dir / COMPONENT_CONFIG).read_text(encoding="utf-8")
+    try:
+        config = json.loads(serialized)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{config_location}: invalid JSON ({error.msg})") from error
+    if not isinstance(config, dict):
+        raise ValueError(f"{component_dir}: component configuration must be a JSON object")
     return {key: value for key, value in config.items() if not key.startswith("_")}
 
 
@@ -271,14 +287,18 @@ def lu_bank_conf_from_component(lu_dir: Path) -> DictConfig:
         ValueError: If the component is not a latent-upscaler bank.
     """
     config = read_component_config(lu_dir)
-    if "models" not in config:
-        msg = f"{lu_dir} is not a latent-upscaler bank component: its config.json has no models list"
+    models = config.get("models")
+    if not isinstance(models, list) or not models:
+        msg = f"{lu_dir}: latent-upscaler component must contain a non-empty models list"
         raise ValueError(msg)
-    weights = str(lu_dir / COMPONENT_WEIGHTS)
+    for index, item in enumerate(models):
+        if not isinstance(item, dict) or item.get("target_scale") not in ("2x", "4x") or not isinstance(item.get("model"), dict):
+            raise ValueError(f"{lu_dir}: models[{index}] must contain target_scale='2x'/'4x' and a model configuration object")
+    weights = str(lu_dir if lu_dir.is_file() else lu_dir / COMPONENT_WEIGHTS)
     keys = ()
     if Path(weights).is_file():
         # Inspect only names in the header, never materialize the model tensors.
-        with safe_open(weights, framework="pt", device="cpu") as archive:
+        with safe_open(weights, framework="pt", device="cpu", backend="pread") as archive:
             keys = tuple(archive.keys())
 
     def prefix(target_scale):
@@ -295,6 +315,6 @@ def lu_bank_conf_from_component(lu_dir: Path) -> DictConfig:
             "checkpoint": weights,
             "state_prefix": prefix(item["target_scale"]),
         }
-        for item in config["models"]
+        for item in models
     ]
     return OmegaConf.create({"latent_upscaler": {"enabled": True, "models": entries}})

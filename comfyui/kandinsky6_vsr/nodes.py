@@ -360,6 +360,11 @@ def _latent_grid(pixel_grid):
     )
 
 
+# Decoded uint8 tiles are kept on the GPU between tile batches and only
+# spilled to system memory past this budget (32 GiB-class cards are fine).
+_GPU_STAGING_LIMIT_BYTES = 8 * 1024**3
+
+
 def _memory_required(frames, scale_hw, tiles_batch_size):
     latent_frames = (frames - 1) // TEMPORAL_FACTOR + 1
     tile_tokens = latent_frames * (VISUAL_SIZE // SPATIAL_FACTOR) ** 2
@@ -437,6 +442,8 @@ class _SRRun:
             )
         settings = sampling.sampling_settings(self.sr_model)
         outputs = []
+        gpu_staging = []
+        gpu_staging_bytes = 0
         for start in range(0, len(tile_inputs), tiles_batch_size):
             mm.throw_exception_if_processing_interrupted()
             chunk = tile_inputs[start : start + tiles_batch_size]
@@ -448,8 +455,17 @@ class _SRRun:
                 noise_type=str(settings["lq_noise_type"]),
             )
             latent = sampling.sample(self.sr_model, initial, len(chunk), num_steps, self.progress, self.memory["dit"])
-            outputs.extend(sample.float().cpu() for sample in self.decode(latent, len(chunk)))
-        return outputs
+            # Decoded uint8 tiles stay on the GPU between batches: round-tripping
+            # every batch through PCIe is the dominant cost on Windows WDDM.
+            decoded = self.decode(latent, len(chunk))
+            gpu_staging.append(decoded)
+            gpu_staging_bytes += decoded.numel() * decoded.element_size()
+            if gpu_staging_bytes > _GPU_STAGING_LIMIT_BYTES:
+                outputs.extend(tile.cpu() for tile in gpu_staging)
+                gpu_staging = []
+                gpu_staging_bytes = 0
+        outputs.extend(tile.cpu() for tile in gpu_staging)
+        return torch.cat(outputs, dim=0)
 
 
 def comfy_images_to_tchw_uint8(images):
@@ -598,6 +614,9 @@ class Kandinsky6VSRUpscale:
             prepare = run.encode_tiles
 
         bar.total = len(tile_inputs) * sampling.steps_per_tile(sr_model, steps)
+        # The int8 SR DiT is ~1.6 GiB: keeping it fully resident in VRAM instead
+        # of streaming weights per layer removes the GPU idle gaps on WDDM.
+        mm.load_models_gpu([sr_model.patcher], memory_required=memory["dit"], force_full_load=True)
         outputs = run.tiles(tile_inputs, prepare, seed=seed, num_steps=steps, tiles_batch_size=tiles_batch_size)
         frames_out = stitch_tiles_hanning(outputs, pixel_grid, height, width, scale=tiling_scale)
         frames_out = padding.crop(frames_out.clamp(0, 255).to(torch.uint8), tiling_scale)

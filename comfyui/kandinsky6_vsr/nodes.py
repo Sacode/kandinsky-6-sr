@@ -428,12 +428,12 @@ class _SRRun:
         with _autocast(self.device):
             latents = latent.reshape(batch, -1, *latent.shape[1:]) / self.sr_vae.scaling_factor
             latents = latents.permute(0, 4, 1, 2, 3)
-            # Decode the whole tile batch in ONE causal pass: the cached KVAE
-            # decoder vectorizes over the batch dim, so per-index calls pay the
-            # full 121-frame sequential pipeline once per tile. This decode
-            # stage dominates the whole node (~87% of wall time).
-            decoded = decode_latent_to_uint8(vae, latents)
-        return torch.cat([decoded], dim=0)
+            # NOTE: a single batched decode_latent_to_uint8(vae, latents) call
+            # OOMs on 32 GB cards: the causal decoder's activations scale
+            # batch x full-T (measured 55+ GB active at batch=3, 121 frames),
+            # so tiles must be decoded one at a time.
+            decoded = [decode_latent_to_uint8(vae, latents[index : index + 1]) for index in range(batch)]
+        return torch.cat(decoded, dim=0)
 
     def tiles(self, tile_inputs, prepare, *, seed, num_steps, tiles_batch_size):
         """Canonical ``_run_tile_batches``: the seed advances once per tile."""

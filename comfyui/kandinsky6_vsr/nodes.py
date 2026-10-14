@@ -614,11 +614,13 @@ class Kandinsky6VSRUpscale:
             prepare = run.encode_tiles
 
         bar.total = len(tile_inputs) * sampling.steps_per_tile(sr_model, steps)
-        # The int8 SR DiT is ~1.6 GiB: keeping it fully resident in VRAM instead
-        # of streaming weights per layer removes the GPU idle gaps on WDDM.
-        # NOTE: sr_model IS the ModelPatcher (ModelPatcherDynamic in 0.39) —
-        # it has no .patcher attribute of its own.
-        mm.load_models_gpu([sr_model], memory_required=memory["dit"], force_full_load=True)
+        # NOTE: ComfyUI 0.39 ModelPatcherDynamic streams weights via GPU vbar +
+        # pinned host buffers *by design* (`assert not full_load` in its load();
+        # pin_weight_to_device raises too). force_full_load is therefore NOT
+        # applicable — do not pass it here, it would assert-crash on a cold
+        # cache. Repeated stage switching (VAE <-> Upsampler <-> DiT) is the
+        # cost driver; keep the server's model cache small so the dynamic
+        # manager can hold all three models resident without re-preparing.
         outputs = run.tiles(tile_inputs, prepare, seed=seed, num_steps=steps, tiles_batch_size=tiles_batch_size)
         frames_out = stitch_tiles_hanning(outputs, pixel_grid, height, width, scale=tiling_scale)
         frames_out = padding.crop(frames_out.clamp(0, 255).to(torch.uint8), tiling_scale)

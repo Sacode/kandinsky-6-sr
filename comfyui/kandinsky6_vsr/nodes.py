@@ -8,7 +8,9 @@ latent and decode it, then blend the tiles with a Hann window.
 """
 
 import contextlib
+import logging
 import os
+import time
 from pathlib import Path
 
 import comfy.model_management as mm
@@ -444,20 +446,31 @@ class _SRRun:
         outputs = []
         gpu_staging = []
         gpu_staging_bytes = 0
+        _prof = {"prepare": 0.0, "sample": 0.0, "decode": 0.0}
         for start in range(0, len(tile_inputs), tiles_batch_size):
             mm.throw_exception_if_processing_interrupted()
             chunk = tile_inputs[start : start + tiles_batch_size]
+            _t = time.perf_counter()
             lq_latent = prepare(chunk).to(device=self.device, dtype=dtype)
+            _prof["prepare"] += time.perf_counter() - _t
             initial = sampling.degraded_start(
                 lq_latent,
                 seed=seed + start,
                 noise_scale=float(settings["lq_noise_scale"]),
                 noise_type=str(settings["lq_noise_type"]),
             )
+            _t = time.perf_counter()
             latent = sampling.sample(self.sr_model, initial, len(chunk), num_steps, self.progress, self.memory["dit"])
+            _prof["sample"] += time.perf_counter() - _t
             # Decoded uint8 tiles stay on the GPU between batches: round-tripping
             # every batch through PCIe is the dominant cost on Windows WDDM.
+            _t = time.perf_counter()
             decoded = self.decode(latent, len(chunk))
+            _prof["decode"] += time.perf_counter() - _t
+            logging.info(
+                "K6PROFILE batch@%d prepare=%.1fs sample=%.1fs decode=%.1fs",
+                start, _prof["prepare"], _prof["sample"], _prof["decode"],
+            )
             gpu_staging.append(decoded)
             gpu_staging_bytes += decoded.numel() * decoded.element_size()
             if gpu_staging_bytes > _GPU_STAGING_LIMIT_BYTES:
@@ -465,6 +478,10 @@ class _SRRun:
                 gpu_staging = []
                 gpu_staging_bytes = 0
         outputs.extend(tile.cpu() for tile in gpu_staging)
+        logging.info(
+            "K6PROFILE sums prepare=%.1fs sample=%.1fs decode=%.1fs",
+            _prof["prepare"], _prof["sample"], _prof["decode"],
+        )
         return torch.cat(outputs, dim=0)
 
 
@@ -598,7 +615,9 @@ class Kandinsky6VSRUpscale:
             )
             video = padding.apply_to_video(video)
             height, width = video.shape[-2:]
+            _t0 = time.perf_counter()
             lr_latent = run.encode_video(video)
+            logging.info("K6PROFILE encode_video %.1fs", time.perf_counter() - _t0)
             _, _, pixel_grid = _tile_geometry(height, width, tiling_scale, overlap)
             tile_inputs = extract_all_tiles(lr_latent, _latent_grid(pixel_grid))
             prepare = run.upscale_tiles
@@ -614,6 +633,7 @@ class Kandinsky6VSRUpscale:
             prepare = run.encode_tiles
 
         bar.total = len(tile_inputs) * sampling.steps_per_tile(sr_model, steps)
+        logging.info("K6PROFILE tiles=%d batch_size=%d frames=%d %dx%d", len(tile_inputs), tiles_batch_size, frames, width, height)
         # NOTE: ComfyUI 0.39 ModelPatcherDynamic streams weights via GPU vbar +
         # pinned host buffers *by design* (`assert not full_load` in its load();
         # pin_weight_to_device raises too). force_full_load is therefore NOT
@@ -621,9 +641,13 @@ class Kandinsky6VSRUpscale:
         # cache. Repeated stage switching (VAE <-> Upsampler <-> DiT) is the
         # cost driver; keep the server's model cache small so the dynamic
         # manager can hold all three models resident without re-preparing.
+        _t0 = time.perf_counter()
         outputs = run.tiles(tile_inputs, prepare, seed=seed, num_steps=steps, tiles_batch_size=tiles_batch_size)
+        logging.info("K6PROFILE tiles_total %.1fs", time.perf_counter() - _t0)
+        _t0 = time.perf_counter()
         frames_out = stitch_tiles_hanning(outputs, pixel_grid, height, width, scale=tiling_scale)
         frames_out = padding.crop(frames_out.clamp(0, 255).to(torch.uint8), tiling_scale)
+        logging.info("K6PROFILE stitch_crop %.1fs", time.perf_counter() - _t0)
 
         target_hw = resolve_target_hw(target_resolution, tuple(frames_out.shape[-2:]))
         if target_hw is not None:

@@ -363,8 +363,10 @@ def _latent_grid(pixel_grid):
 
 
 # Decoded uint8 tiles are kept on the GPU between tile batches and only
-# spilled to system memory past this budget (32 GiB-class cards are fine).
-_GPU_STAGING_LIMIT_BYTES = 8 * 1024**3
+# spilled to system memory past this budget. 2 GiB is enough to hide the
+# per-batch decode latency; a larger buffer just competes with the stitch
+# canvas for VRAM on 32 GB cards.
+_GPU_STAGING_LIMIT_BYTES = 2 * 1024**3
 
 
 def _memory_required(frames, scale_hw, tiles_batch_size):

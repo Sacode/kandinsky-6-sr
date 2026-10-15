@@ -239,7 +239,9 @@ def stitch_tiles_hanning(
 
     out_h = original_h * scale
     out_w = original_w * scale
-    pred_acc = torch.zeros(c, t, out_h, out_w, device=device)
+    # bf16 canvas: tiles are uint8 (exactly representable) and Hann blending
+    # tolerates an 8-bit mantissa; halves the canvas vs the fp32 default.
+    pred_acc = torch.zeros(c, t, out_h, out_w, device=device, dtype=torch.bfloat16)
     weight_acc = torch.zeros(1, 1, out_h, out_w, device=device)
 
     tile_idx = 0
@@ -248,8 +250,8 @@ def stitch_tiles_hanning(
             y = top * scale
             x = left * scale
             tile = tiles[tile_idx]
-            pred_acc[:, :, y : y + hr_tile_h, x : x + hr_tile_w] += tile * window
+            pred_acc[:, :, y : y + hr_tile_h, x : x + hr_tile_w] += (tile * window).to(pred_acc.dtype)
             weight_acc[:, :, y : y + hr_tile_h, x : x + hr_tile_w] += window
             tile_idx += 1
 
-    return pred_acc / weight_acc.clamp(min=1e-6)
+    return pred_acc / weight_acc.clamp(min=1e-6).to(pred_acc.dtype)
